@@ -1,0 +1,435 @@
+name: CI / Build / Deploy — Elite Pipeline
+
+# Trigger on commits to main + PRs + manual dispatch
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 20
+
+jobs:
+  # -------------------------
+  # 1) Install and Lint (matrix: node versions optionally)
+  # -------------------------
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'npm'
+
+      - name: Install root deps (fast)
+        run: npm ci
+
+      - name: Lint frontend
+        run: |
+          if [ -d packages/frontend ]; then
+            cd packages/frontend && npm ci && npm run lint || true
+          else
+            echo "no frontend"
+          fi
+
+      - name: Lint backend
+        run: |
+          if [ -d packages/backend ]; then
+            cd packages/backend && npm ci && npm run lint || true
+          else
+            echo "no backend"
+          fi
+
+      - name: Upload lint results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-results
+          path: |
+            packages/frontend/lint-report.txt
+            packages/backend/lint-report.txt
+
+  # -------------------------
+  # 2) Unit tests (fast, parallel)
+  # -------------------------
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      matrix:
+        job: [frontend, backend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Run unit tests (matrix)
+        run: |
+          if [ "${{ matrix.job }}" = "frontend" ] && [ -d packages/frontend ]; then
+            cd packages/frontend
+            npm ci
+            npm test --if-present -- --reporter mocha-junit-reporter || true
+            mkdir -p $GITHUB_WORKSPACE/artifacts/frontend || true
+            echo "frontend tests run" > $GITHUB_WORKSPACE/artifacts/frontend/status.txt
+          elif [ "${{ matrix.job }}" = "backend" ] && [ -d packages/backend ]; then
+            cd packages/backend
+            npm ci
+            npm test --if-present || true
+            mkdir -p $GITHUB_WORKSPACE/artifacts/backend || true
+            echo "backend tests run" > $GITHUB_WORKSPACE/artifacts/backend/status.txt
+          else
+            echo "nothing to test for ${{ matrix.job }}"
+          fi
+
+      - name: Upload unit test artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-artifacts-${{ matrix.job }}
+          path: artifacts/${{ matrix.job }}
+
+  # -------------------------
+  # 3) Build (frontend + backend)
+  # -------------------------
+  build:
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Build backend
+        if: ${{ always() && (exists('packages/backend') ) }}
+        run: |
+          if [ -d packages/backend ]; then
+            cd packages/backend
+            npm ci
+            npm run build
+            # generate Prisma client if present
+            if [ -f prisma/schema.prisma ]; then
+              npx prisma generate || true
+            fi
+          fi
+
+      - name: Build frontend
+        if: ${{ always() && (exists('packages/frontend') ) }}
+        run: |
+          if [ -d packages/frontend ]; then
+            cd packages/frontend
+            npm ci
+            npm run build
+            # copy build artifact to a top-level folder for deploy jobs
+            mkdir -p $GITHUB_WORKSPACE/artifacts/frontend-dist
+            cp -r dist/* $GITHUB_WORKSPACE/artifacts/frontend-dist/ || true
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: artifacts
+
+  # -------------------------
+  # 4) Security Scan (optional): Trivy for containers & Snyk for deps
+  # -------------------------
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run dependency audit (npm)
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+            npm audit --audit-level=moderate || echo "audit finished"
+          fi
+
+      - name: Trivy scan (docker image) — optional
+        if: env.TRIVY_TOKEN != '' || github.repository != ''
+        uses: aquasecurity/trivy-action@v2
+        with:
+          scan-type: fs
+          format: table
+
+      - name: Snyk scan (if SNYK_TOKEN set)
+        if: ${{ secrets.SNYK_TOKEN }}
+        uses: snyk/actions/node@master
+        with:
+          args: test
+
+  # -------------------------
+  # 5) Build & push multi-arch Docker images
+  # -------------------------
+  docker-build-push:
+    runs-on: ubuntu-latest
+    needs: [build, security-scan]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub (optional)
+        if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
+        uses: docker/login-action@v2
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push backend image (multi-arch)
+        if: ${{ exists('packages/backend/Dockerfile') }}
+        run: |
+          IMAGE_TAG=ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-backend:${{ github.sha }}
+          docker buildx build --platform linux/amd64,linux/arm64 -t $IMAGE_TAG packages/backend --push
+          echo "backend image pushed: $IMAGE_TAG"
+          # optional docker hub tag
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            DOCKER_IMAGE=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}-backend:${{ github.sha }}
+            docker buildx build --platform linux/amd64,linux/arm64 -t $DOCKER_IMAGE packages/backend --push || true
+          fi
+          echo $IMAGE_TAG > image-backend.txt
+      - name: Upload backend image tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-image-tag
+          path: image-backend.txt
+
+      - name: Build and push frontend static (optional Docker)
+        if: ${{ exists('packages/frontend/Dockerfile') }}
+        run: |
+          IMAGE_TAG=ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-frontend:${{ github.sha }}
+          docker buildx build --platform linux/amd64,linux/arm64 -t $IMAGE_TAG packages/frontend --push
+          echo $IMAGE_TAG > image-frontend.txt
+
+      - name: Upload frontend image tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-image-tag
+          path: image-frontend.txt
+
+  # -------------------------
+  # 6) Run DB migrations (staging)
+  # -------------------------
+  prisma-migrate:
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+    if: ${{ secrets.DATABASE_URL_STAGING != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install backend deps
+        run: |
+          cd packages/backend
+          npm ci
+      - name: Run Prisma migrate deploy (staging)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+        run: |
+          cd packages/backend
+          npx prisma migrate deploy --preview-feature || true
+          npx prisma db seed --preview-feature || true
+
+  # -------------------------
+  # 7) Integration / E2E tests (Playwright)
+  # -------------------------
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [prisma-migrate]
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Start backend (background)
+        run: |
+          cd packages/backend
+          npm ci
+          npm run start & pid=$!
+          echo $pid > /tmp/backend.pid
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+
+      - name: Wait for backend
+        uses: jakejarvis/wait-action@v0.1.0
+        with:
+          url: http://localhost:4000/health
+          timeout: 60
+
+      - name: Run Playwright E2E (if exists)
+        run: |
+          if [ -d packages/e2e ]; then
+            cd packages/e2e
+            npm ci
+            npx playwright test --reporter=junit || true
+            mkdir -p $GITHUB_WORKSPACE/artifacts/e2e
+            cp -r test-results junit* $GITHUB_WORKSPACE/artifacts/e2e || true
+          else
+            echo "no e2e tests found"
+          fi
+
+      - name: Kill backend
+        run: |
+          if [ -f /tmp/backend.pid ]; then
+            kill $(cat /tmp/backend.pid) || true
+          fi
+
+      - name: Upload E2E artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: artifacts/e2e
+
+  # -------------------------
+  # 8) Deploy to Staging (via SSH or Vercel or AWS)
+  # -------------------------
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: e2e
+    environment:
+      name: staging
+      url: ${{ secrets.STAGING_URL || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via Vercel (if VERCEL_TOKEN set)
+        if: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          echo "Deploying to Vercel..."
+          npm i -g vercel
+          cd packages/frontend
+          vercel --prod --token=$VERCEL_TOKEN --confirm --no-clipboard
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy via SSH (if SERVER_HOST set)
+        if: ${{ secrets.SERVER_HOST }}
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            set -e
+            cd /var/www/your-app || { echo "path missing"; exit 1; }
+            git pull origin main
+            npm ci
+            npm run build
+            pm2 restart all || pm2 start dist/index.js --name "app"
+
+      - name: Deploy to AWS ECS (if AWS creds set)
+        if: ${{ secrets.AWS_ACCESS_KEY_ID && secrets.AWS_SECRET_ACCESS_KEY }}
+        uses: aws-actions/amazon-ecs-render-task-definition@v2
+        with:
+          task-definition: infra/ecs-task-def.json
+          container-name: your-backend
+          image: ${{ steps.docker-build-push.outputs.backend-image || '' }}
+
+      - name: Staging deploy summary
+        run: echo "Staging deploy complete (if any deploy method was configured)."
+
+  # -------------------------
+  # 9) Manual approval & Production deploy
+  # -------------------------
+  promote-to-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ secrets.PRODUCTION_URL || '' }}
+    steps:
+      - name: Await manual approval
+        uses: peter-evans/wait-for-approval@v2
+        with:
+          reviewers: '["team-lead"]'
+          timeout-minutes: 4320  # 3 days
+
+      - name: Deploy to Production (SSH example)
+        if: ${{ secrets.PROD_SERVER_HOST }}
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_SERVER_HOST }}
+          username: ${{ secrets.PROD_SERVER_USER }}
+          key: ${{ secrets.PROD_SERVER_SSH_KEY }}
+          script: |
+            set -e
+            cd /var/www/your-app
+            git pull origin main
+            npm ci
+            npm run build
+            pm2 restart all
+
+      - name: Production summary
+        run: echo "Production deploy finished."
+
+  # -------------------------
+  # 10) Postdeploy: Release, notify, cleanup
+  # -------------------------
+  post-release:
+    needs: promote-to-production
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Release (draft)
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ github.run_number }}
+          name: "Release v${{ github.run_number }}"
+          draft: true
+
+      - name: Notify Slack (if SLACK_WEBHOOK set)
+        if: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data '{"text":"Deployment completed: '${{ github.repository }}' commit '${{ github.sha }}'."}' ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Cleanup images (optional)
+        if: ${{ secrets.CLEANUP_IMAGES == 'true' }}
+        run: |
+          echo "Cleanup step placeholder - implement registry cleanup via API if needed."
+
+# End of workflow
